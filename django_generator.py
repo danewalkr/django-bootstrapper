@@ -25,29 +25,54 @@ from typing import Optional, Callable, List
 import shutil
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import logging
+from datetime import datetime
+from tkinter.scrolledtext import ScrolledText
+
+__version__ = "1.0.0"
+
+# --- Logging setup ---
+LOG_FILE = Path.home() / ".django_generator.log"
+
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+logging.info(f"--- Django Generator started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
 
 # -------------------------
 # Helpers
 # -------------------------
 def run_command(cmd: List[str], cwd: Optional[str] = None, cb: Optional[Callable] = None) -> str:
-    """Run a subprocess command safely (cross-platform), logging output incrementally."""
+    """Run subprocess command safely (cross-platform) and log output incrementally."""
     try:
-        # Ensure all args are strings (handles Path objects)
         cmd = [str(c) for c in cmd]
+        shell_flag = os.name == "nt"  # needed for Windows PATH resolution
         log(cb, f"→ {' '.join(cmd)}")
-        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, shell=False)
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, shell=shell_flag)
+
         if proc.stdout:
             for line in proc.stdout.strip().splitlines():
                 log(cb, f"   {line}")
+
         if proc.returncode != 0:
             err = proc.stderr.strip() or proc.stdout.strip()
-            raise RuntimeError(err or f"Command {cmd[0]} failed with code {proc.returncode}")
+            log(cb, f"❌ Aborting — command failed: {err}")
+            raise SystemExit(1)
+
         return proc.stdout.strip()
+
     except Exception as e:
         log(cb, f"❌ Error running {' '.join(cmd)}: {e}")
         raise
 
-def log(cb: Optional[Callable], msg: str):
+def log(cb: Optional[Callable], msg: str, level=logging.INFO):
+    """Unified logging helper (writes to file + GUI + console)."""
+    logging.log(level, msg)
+
+    # Send to GUI callback if available
     if cb:
         cb(msg)
     else:
@@ -148,9 +173,21 @@ def install_django(python_exe: Path, version: str, cb=None):
     log(cb, "✅ Django ready.")
 
 def create_django_project(dest: Path, project_name: str, python_exe: Path, cb=None):
+    """
+    Create the Django project inside dest without nesting or conflicts.
+    Uses '.' as target so manage.py lives directly in dest.
+    """
     log(cb, f"🧱 Creating Django project '{project_name}' in {dest} ...")
-    run_command([str(python_exe), "-m", "django", "startproject", project_name, str(dest)], cb=cb)
-    log(cb, "✅ Project created.")
+    try:
+        run_command(
+            [str(python_exe), "-m", "django", "startproject", project_name, "."],
+            cwd=str(dest),
+            cb=cb
+        )
+        log(cb, "✅ Project created.")
+    except Exception as e:
+        log(cb, f"❌ Failed to create Django project: {e}")
+        raise SystemExit(1)
 
 def create_apps(dest: Path, apps: List[str], python_exe: Path, cb=None):
     if not apps:
@@ -360,34 +397,80 @@ def write_requirements(python_exe: Path, dest: Path, cb=None):
     except Exception as e:
         log(cb, f"⚠️ Could not write requirements.txt: {e}")
 
+def create_gitignore(dest: Path, cb=None):
+    """Create a sensible .gitignore for Django projects."""
+    gitignore_content = textwrap.dedent("""\
+        # Python
+        __pycache__/
+        *.py[cod]
+        *.pyo
+        *.pyd
+        .Python
+        env/
+        venv/
+        .venv/
+        build/
+        develop-eggs/
+        dist/
+        downloads/
+        eggs/
+        .eggs/
+        lib/
+        lib64/
+        parts/
+        sdist/
+        var/
+        *.egg-info/
+        .installed.cfg
+        *.egg
+
+        # Django
+        *.log
+        local_settings.py
+        db.sqlite3
+        media/
+
+        # VSCode
+        .vscode/
+
+        # macOS / Windows
+        .DS_Store
+        Thumbs.db
+    """)
+    safe_create_file(dest / ".gitignore", gitignore_content, overwrite=False)
+    log(cb, "✅ .gitignore created.")
+
+
 def init_git(dest: Path, cb=None):
+    """Initialize a Git repo cleanly (idempotent)."""
     try:
+        create_gitignore(dest, cb=cb)  # ensure .gitignore first
         run_command(["git", "init"], cwd=str(dest), cb=cb)
-        log(cb, "✅ Git repository initialized.")
+        log(cb, "✅ Git repository initialized with .gitignore.")
     except Exception as e:
-        log(cb, f"⚠️ Git init failed: {e}")
+        log(cb, f"⚠️ Git initialization failed: {e}")
+
 
 # -------------------------
 # High-level create_project
 # -------------------------
 def create_project(
-    destination: str,
-    project_name: str,
-    python_exec: str,
-    create_venv: bool,
-    apps: List[str],
-    django_version: str,
-    create_templates: bool,
-    init_git_flag: bool,
-    cb: Optional[Callable] = None
-):
+        destination: str,
+        project_name: str,
+        python_exec: str,
+        create_venv: bool,
+        apps: List[str],
+        django_version: str,
+        create_templates: bool,
+        init_git_flag: bool,
+        cb: Optional[Callable] = None
+    ):
     dest = Path(destination).expanduser().resolve()
     dest.mkdir(parents=True, exist_ok=True)
     log(cb, f"📁 Destination: {dest}")
 
     python_path = Path(python_exec) if python_exec and Path(python_exec).exists() else None
 
-    # create or reuse venv
     if create_venv:
         python_in_venv = create_virtualenv(dest, cb=cb)
         python_path = python_in_venv
@@ -397,11 +480,8 @@ def create_project(
     install_django(python_path, django_version, cb=cb)
     create_django_project(dest, project_name, python_path, cb=cb)
     create_apps(dest, apps, python_path, cb=cb)
-
-    # patch settings: repo root is dest (where manage.py lives)
     patch_settings(dest, project_name, apps, cb=cb)
 
-    # templates/static placed at repo root (next to manage.py)
     if apps:
         create_urls(dest, project_name, apps, cb=cb)
 
@@ -411,7 +491,7 @@ def create_project(
     write_requirements(python_path, dest, cb=cb)
 
     if init_git_flag:
-        init_git(dest, cb=cb)
+        init_git(dest, cb=cb)  # now handles gitignore internally
 
     log(cb, "🎉 Django project created successfully!")
 
@@ -421,7 +501,7 @@ def create_project(
 class DjangoGeneratorApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Django Project Generator")
+        self.title(f"Django Project Generator v{__version__}")
         self.geometry("1000x540")
         self._build_ui()
 
@@ -464,7 +544,12 @@ class DjangoGeneratorApp(tk.Tk):
         self.git_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(left, text="Initialize git repository", variable=self.git_var).grid(row=12, column=0, columnspan=2, sticky="w")
 
-        ttk.Button(left, text="Create Project", command=self._on_create).grid(row=13, column=0, columnspan=2, sticky="we", pady=(12, 0))
+        self.gitignore_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(left, text="Add .gitignore file", variable=self.gitignore_var).grid(row=13, column=0, columnspan=2, sticky="w")
+
+        ttk.Button(left, text="Create Project", command=self._on_create).grid(row=14, column=0, columnspan=2, sticky="we", pady=(12, 0))
+        ttk.Button(left, text="Open Log File", command=self._open_log).grid(row=15, column=0, columnspan=2, sticky="we", pady=(6, 0))
+        ttk.Button(left, text="Need Help?", command=self._show_help).grid(row=16, column=0, columnspan=2, sticky="we", pady=(6, 0))
 
         ttk.Label(right, text="Progress log:").pack(anchor="w")
         self.log = tk.Text(right, height=25, wrap="word", state="disabled")
@@ -488,12 +573,23 @@ class DjangoGeneratorApp(tk.Tk):
 
 
     def _on_create(self):
-        dest = self.path_var.get()
+        dest = self.path_var.get().strip()
         name = self.project_var.get().strip()
         python_exec = self.python_var.get().strip() or ""
         apps = [a.strip() for a in self.apps_var.get().split(",") if a.strip()]
+
         if not name:
             messagebox.showerror("Error", "Project name required.")
+            return
+
+        # ✅ Confirmation prompt before starting project creation
+        confirm = messagebox.askyesno(
+            "Confirm Project Creation",
+            f"Are you sure you want to create '{name}' at:\n\n{dest}?"
+        )
+
+        if not confirm:
+            self.status_var.set("Cancelled.")
             return
 
         self.status_var.set("Running...")
@@ -502,6 +598,7 @@ class DjangoGeneratorApp(tk.Tk):
             args=(dest, name, python_exec, apps),
             daemon=True,
         ).start()
+
 
     def _create_thread(self, dest, name, python_exec, apps):
         try:
@@ -516,13 +613,102 @@ class DjangoGeneratorApp(tk.Tk):
                 init_git_flag=self.git_var.get(),
                 cb=self._append_log
             )
+            if self.gitignore_var.get():
+                create_gitignore(Path(dest), cb=self._append_log)
+
             self.status_var.set("Done.")
-            messagebox.showinfo("Success", "✅ Django project created successfully!")
+
+            # ✅ Post-success prompt
+            resp = messagebox.askyesno(
+                "Success 🎉",
+                "✅ Django project created successfully!\n\n"
+                "Do you want to open it in VSCode?"
+            )
+            if resp:
+                self._open_vscode(dest)
+
+            # ✅ Optional Runserver prompt
+            run_resp = messagebox.askyesno(
+                "Launch Server?",
+                "Would you like to start Django’s development server now?"
+            )
+            if run_resp:
+                self._launch_runserver(dest, name)
+
         except Exception as e:
             import traceback
             self._append_log(traceback.format_exc())
             self.status_var.set("Error.")
             messagebox.showerror("Error", str(e))
+
+    def _launch_runserver(self, dest, project_name):
+        """Launch Django runserver from within the generator."""
+        try:
+            manage_py = Path(dest) / "manage.py"
+            if not manage_py.exists():
+                messagebox.showerror("Error", "manage.py not found. Cannot runserver.")
+                return
+
+            shell_flag = os.name == "nt"
+            log(self._append_log, f"🚀 Starting Django development server for {project_name} ...")
+
+            subprocess.Popen(
+                [sys.executable, str(manage_py), "runserver"],
+                cwd=str(dest),
+                shell=shell_flag
+            )
+            messagebox.showinfo("Server Running", "Django development server started.\nCheck your terminal window.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to launch runserver: {e}")
+
+    def _open_log(self):
+        try:
+            if not LOG_FILE.exists():
+                messagebox.showinfo("Log File", "No log file found yet.")
+                return
+            if sys.platform.startswith("win"):
+                os.startfile(LOG_FILE)
+            elif sys.platform.startswith("darwin"):
+                subprocess.run(["open", LOG_FILE])
+            else:
+                subprocess.run(["xdg-open", LOG_FILE])
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open log file: {e}")
+
+    def _show_help(self):
+        help_text = (
+            "How to Use Django Project Generator:\n\n"
+            "1. Select the folder where you want your project to be created.\n"
+            "2. Enter a project name. Avoid spaces or special characters.\n"
+            "3. (Optional) Enter the path to your Python executable if you don’t want to use the default one.\n"
+            "4. Check 'Create virtualenv (.venv)' if you want the tool to set up a virtual environment.\n"
+            "5. Specify any Django apps you want to create, separated by commas.\n"
+            "6. You can also set a specific Django version, or leave it blank to install the latest.\n"
+            "7. Click 'Create Project' to start the process. Progress will appear in the log window.\n\n"
+            "After generation, you can open the log file for more details or troubleshooting info.\n"
+            "The created project will include basic templates, static files, and app routing by default."
+        )
+        messagebox.showinfo("Help - Django Project Generator", help_text)
+
+    def _open_vscode(self, folder=None):
+        """Open generated project in VSCode reliably across OS."""
+        folder = folder or self.path_var.get()
+        if not folder or not Path(folder).exists():
+            messagebox.showerror("Error", "Project folder does not exist.")
+            return
+        try:
+            # use shell=True for PATH lookup on Windows
+            shell_flag = os.name == "nt"
+            subprocess.Popen(["code", folder], shell=shell_flag)
+            log(None, f"🧠 Opened project in VSCode: {folder}")
+        except FileNotFoundError:
+            messagebox.showerror(
+                "VSCode Not Found",
+                "VSCode ('code' command) not found in PATH.\n\n"
+                "Make sure VSCode is installed and 'code' CLI is enabled."
+            )
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open VSCode: {e}")
 
 # -------------------------
 # Run

@@ -2,7 +2,7 @@
 
 A single-file Python GUI tool that creates full Django projects in seconds — with optional virtualenv setup, app creation, templates, and more.
 
-## 🚀 Features
+## Features
 - One-click Django project creation
 - Optional `.venv` creation
 - Installs Django (version optional)
