@@ -30,16 +30,21 @@ from tkinter import ttk, filedialog, messagebox
 # Helpers
 # -------------------------
 def run_command(cmd: List[str], cwd: Optional[str] = None, cb: Optional[Callable] = None) -> str:
-    """Run subprocess, return stdout, raise on failure (logs to cb if provided)."""
+    """Run a subprocess command safely (cross-platform), logging output incrementally."""
     try:
+        # Ensure all args are strings (handles Path objects)
+        cmd = [str(c) for c in cmd]
+        log(cb, f"→ {' '.join(cmd)}")
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, shell=False)
+        if proc.stdout:
+            for line in proc.stdout.strip().splitlines():
+                log(cb, f"   {line}")
         if proc.returncode != 0:
             err = proc.stderr.strip() or proc.stdout.strip()
-            raise RuntimeError(err or f"Command {cmd} failed with code {proc.returncode}")
+            raise RuntimeError(err or f"Command {cmd[0]} failed with code {proc.returncode}")
         return proc.stdout.strip()
     except Exception as e:
-        if cb:
-            cb(f"❌ Error running {' '.join(cmd)}: {e}")
+        log(cb, f"❌ Error running {' '.join(cmd)}: {e}")
         raise
 
 def log(cb: Optional[Callable], msg: str):
@@ -156,10 +161,16 @@ def create_apps(dest: Path, apps: List[str], python_exe: Path, cb=None):
         run_command([str(python_exe), str(manage_py), "startapp", app], cwd=str(dest), cb=cb)
 
 def safe_create_file(path: Path, content: str, overwrite=False):
-    if path.exists() and not overwrite:
-        return
+    """Safely write file, avoiding accidental data loss."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and not overwrite:
+        # Don’t overwrite — only create if missing
+        return
+    if path.exists() and overwrite:
+        backup = path.with_suffix(path.suffix + ".bak")
+        shutil.copy2(path, backup)
     path.write_text(content, encoding="utf-8")
+
 
 def create_template_structure(repo_root: Path, apps: List[str], cb=None):
     """
@@ -193,8 +204,9 @@ def create_template_structure(repo_root: Path, apps: List[str], cb=None):
 def patch_settings(repo_root: Path, project_name: str, apps: List[str], cb=None):
     """
     Safely patch settings.py:
-    - Adds apps to INSTALLED_APPS
-    - Ensures templates and static directories configured correctly
+    - Adds apps to INSTALLED_APPS only once.
+    - Ensures template/static dirs configured properly.
+    - Fully idempotent.
     """
     settings_path = repo_root / project_name / "settings.py"
     if not settings_path.exists():
@@ -202,50 +214,47 @@ def patch_settings(repo_root: Path, project_name: str, apps: List[str], cb=None)
         return
 
     text = settings_path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    new_lines = []
+    in_apps = False
 
-    # --- Inject apps into INSTALLED_APPS ---
-    if "INSTALLED_APPS" in text:
-        lines = text.splitlines()
-        new_lines = []
-        inside_apps = False
-        for line in lines:
-            if "INSTALLED_APPS" in line:
-                inside_apps = True
-            if inside_apps and line.strip().startswith("]"):
+    for line in lines:
+        stripped = line.strip()
+        # Detect INSTALLED_APPS block
+        if stripped.startswith("INSTALLED_APPS"):
+            in_apps = True
+            new_lines.append(line)
+            continue
+        if in_apps:
+            if stripped.startswith("]"):
                 for app in apps:
                     if f"'{app}'" not in text and f'"{app}"' not in text:
                         new_lines.append(f"    '{app}',")
-                inside_apps = False
-            new_lines.append(line)
-        text = "\n".join(new_lines)
-    else:
-        apps_block = "INSTALLED_APPS = [\n" + "".join(f"    '{a}',\n" for a in apps) + "]\n"
-        text = apps_block + "\n" + text
+                in_apps = False
+        new_lines.append(line)
 
-    # --- Fix template DIRS ---
+    new_text = "\n".join(new_lines)
+
+    # --- Ensure TEMPLATES 'DIRS' ---
     import re
-    pattern = re.compile(r"'DIRS'\s*:\s*\[[^\]]*\]")
-    if pattern.search(text):
-        text = pattern.sub("'DIRS': [BASE_DIR / 'templates']", text)
-    elif "TEMPLATES" in text:
-        insertion = "            'DIRS': [BASE_DIR / 'templates'],\n"
-        text = text.replace("'APP_DIRS': True,", f"{insertion}            'APP_DIRS': True,")
+    if re.search(r"'DIRS'\s*:\s*\[", new_text):
+        new_text = re.sub(r"'DIRS'\s*:\s*\[[^\]]*\]", "'DIRS': [BASE_DIR / 'templates']", new_text)
+    elif "TEMPLATES" in new_text:
+        new_text = new_text.replace(
+            "'APP_DIRS': True,",
+            "            'DIRS': [BASE_DIR / 'templates'],\n            'APP_DIRS': True,"
+        )
 
-    # --- Ensure STATIC_URL is correct ---
-    if "STATIC_URL" not in text:
-        text += "\nSTATIC_URL = '/static/'\n"
-    else:
-        text = re.sub(r'STATIC_URL\s*=\s*[\'"]static/?[\'"]', "STATIC_URL = '/static/'", text)
+    # --- Ensure STATIC_URL & STATICFILES_DIRS ---
+    if not re.search(r"STATIC_URL\s*=", new_text):
+        new_text += "\nSTATIC_URL = '/static/'\n"
+    new_text = re.sub(r"STATIC_URL\s*=\s*['\"].*?['\"]", "STATIC_URL = '/static/'", new_text)
+    if "STATICFILES_DIRS" not in new_text:
+        new_text += "\nSTATICFILES_DIRS = [BASE_DIR / 'static']\n"
 
-    # --- Ensure STATICFILES_DIRS block ---
-    if "STATICFILES_DIRS" not in text:
-        text += "\n# Additional static files (CSS, JS, images)\nSTATICFILES_DIRS = [BASE_DIR / 'static']\n"
+    settings_path.write_text(new_text, encoding="utf-8")
+    log(cb, "🧩 settings.py patched cleanly (idempotent, safe).")
 
-    # --- Clean up potential syntax issues ---
-    text = text.replace(",,", ",").replace("[[", "[").replace("]]", "]")
-
-    settings_path.write_text(text, encoding="utf-8")
-    log(cb, "🧩 settings.py patched cleanly (apps + templates + static).")
 
 def create_urls(repo_root: Path, project_name: str, apps: List[str], cb=None):
     """
@@ -470,10 +479,13 @@ class DjangoGeneratorApp(tk.Tk):
             self.path_var.set(folder)
 
     def _append_log(self, msg):
-        self.log.configure(state="normal")
-        self.log.insert("end", msg + "\n")
-        self.log.see("end")
-        self.log.configure(state="disabled")
+        def _safe():
+            self.log.configure(state="normal")
+            self.log.insert("end", msg + "\n")
+            self.log.see("end")
+            self.log.configure(state="disabled")
+        self.after(0, _safe)  # ✅ Schedule on main thread
+
 
     def _on_create(self):
         dest = self.path_var.get()
